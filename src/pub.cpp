@@ -7,13 +7,13 @@ class JointTrajectoryPublisher : public rclcpp::Node {
    public:
     JointTrajectoryPublisher() : Node("joint_trajectory_publisher"), counter_(0) {
         // Declare parameters:
-        // - publish_rate: double (Hz) with a default value of 1.0.
+        // - publish_rate: double (Hz) with a default value of 100.0.
         // - publish_topic: string parameter with the topic name. Default:
-        // "/joint_trajectory_point".
-        // - num_positions: int parameter for how many numbers (positions) to include. Default: 6.
+        // "/right_arm".
+        // - num_positions: int parameter for how many numbers (positions) to include. Default: 11.
         this->declare_parameter<double>("publish_rate", 100.0);
         this->declare_parameter<std::string>("publish_topic", "/right_arm");
-        this->declare_parameter<int>("num_positions", 6);
+        this->declare_parameter<int>("num_positions", 11);
 
         // Get parameter values
         double publish_rate = this->get_parameter("publish_rate").as_double();

@@ -30,8 +30,8 @@ class LossCalculatorSubscriber : public rclcpp::Node {
           loss_count_(0),
           prev_value_(0),
           last_loss_count_(0) {
-        // Declare a parameter for topic name to subscribe (default: "/joint_trajectory_point")
-        this->declare_parameter<std::string>("subscribe_topic", "/joint_trajectory_point");
+        // Declare a parameter for topic name to subscribe (default: "/right_arm_republish")
+        this->declare_parameter<std::string>("subscribe_topic", "/right_arm_republish");
         std::string topic = this->get_parameter("subscribe_topic").as_string();
 
         // Create the subscription.
