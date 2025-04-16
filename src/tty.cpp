@@ -19,25 +19,35 @@ using namespace std;
 // Global control flag (set to false on SIGINT)
 atomic<bool> running(true);
 
-// Device path (from command-line argument)
+// Device path and package size (set via command-line arguments)
 string devicePath;
+int packageSize = 0;  // number of values per package
 
 // Mutex to protect shared statistics
 mutex mtx;
 
-// Global variables to track overall statistics
+// Global statistics
 int first_seq = -1;        // first package sequence seen
 int last_seq = -1;         // last package sequence seen
 int overall_received = 0;  // count of logs processed (each log equals one package received)
 int overall_loss = 0;      // accumulated lost packages
 
 // For per-second stats
-int current_sec = 0;   // current second (epoch time) for which we are accumulating
-int sec_expected = 0;  // expected package count in the current second (sum of differences)
-int sec_received =
-    0;             // number of logs received in current second (typically one per log transition)
-int sec_loss = 0;  // lost packages in current second
+int current_sec = 0;       // current second (epoch time) for which we are accumulating
+int sec_expected = 0;      // expected package count in the current second (sum of differences)
+int sec_received = 0;      // number of logs received in current second
+int sec_loss = 0;          // lost packages in current second
 vector<int> loss_per_sec;  // history (each element = lost packages in a finished second)
+
+
+// Print usage information.
+void printUsage(const char *progName) {
+    cout << "Usage: " << progName << " -d <serial_device_path> -s <package_size>\n\n"
+         << "Options:\n"
+         << "  -d, --device   [DEVICE]     Specify the serial device path (e.g., /dev/ttyUSB0).\n"
+         << "  -s, --size     [SIZE]       Specify the size of each package (e.g., 11).\n"
+         << "  -h, --help                  Print this help message and exit.\n";
+}
 
 // SIGINT handler – simply mark the running flag false.
 void sigintHandler(int signum) {
@@ -61,7 +71,7 @@ string readLine(int fd, string &buffer) {
         if (n > 0) {
             buffer.append(temp, n);
         } else {
-            // No data available; wait a bit before retrying.
+            // No data available; wait a bit.
             this_thread::sleep_for(chrono::milliseconds(10));
         }
     }
@@ -120,8 +130,8 @@ void readSerial() {
                 double packageValue = 0.0;
                 bool gotValue = false;
 
-                // Read subsequent lines until 11 numbers are obtained.
-                while (numbersRead < 11 && running) {
+                // Read subsequent lines until we have obtained packageSize numbers.
+                while (numbersRead < packageSize && running) {
                     string numsLine = readLine(fd, dataBuffer);
                     istringstream iss(numsLine);
                     double val;
@@ -131,23 +141,23 @@ void readSerial() {
                             gotValue = true;
                         }
                         numbersRead++;
-                        if (numbersRead >= 11)
+                        if (numbersRead >= packageSize)
                             break;
                     }
                 }
 
                 int seq = static_cast<int>(packageValue);
-                // Get the current time (epoch seconds).
+                // Get the current epoch second.
                 int now_sec =
                     static_cast<int>(chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
                 {
                     lock_guard<mutex> lock(mtx);
-                    // Check for time boundary BEFORE updating per-second counters.
+                    // Check the time boundary BEFORE updating per-second counters.
                     if (current_sec == 0) {
                         current_sec = now_sec;
                     } else if (now_sec != current_sec) {
-                        // Finalize the previous second.
+                        // Finalize previous second's statistics.
                         loss_per_sec.push_back(sec_loss);
                         // Reset per-second counters for the new second.
                         sec_expected = 0;
@@ -165,10 +175,10 @@ void readSerial() {
                         int diff = seq - last_seq;
                         int lost = (diff > 1) ? (diff - 1) : 0;
 
-                        overall_received++;    // count one package received
+                        overall_received++;    // one package received
                         overall_loss += lost;  // update overall lost count
 
-                        // Update per-second counters for the current log.
+                        // Update per-second counters for this package.
                         sec_expected += diff;
                         sec_received++;
                         sec_loss += lost;
@@ -211,7 +221,7 @@ void printStats() {
     }
 }
 
-// After SIGINT (or when running stops), print final overall statistics.
+// After SIGINT (or when running stops), print overall statistics.
 void printFinalStats() {
     lock_guard<mutex> lock(mtx);
     // If there is an unfinished second, record its loss value.
@@ -239,24 +249,59 @@ void printFinalStats() {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <serial_device_path>" << endl;
+    if (argc < 5) {
+        printUsage(argv[0]);
         return 1;
     }
-    // Set device path from command-line arguments.
-    devicePath = argv[1];
+
+    // Simple command-line argument parsing.
+    for (int i = 1; i < argc; i++) {
+        string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            printUsage(argv[0]);
+            return 0;
+        } else if (arg == "-d" || arg == "--device") {
+            if (i + 1 < argc) {
+                devicePath = argv[++i];
+            } else {
+                cerr << "Error: Missing argument for " << arg << endl;
+                return 1;
+            }
+        } else if (arg == "-s" || arg == "--size") {
+            if (i + 1 < argc) {
+                packageSize = atoi(argv[++i]);
+                if (packageSize <= 0) {
+                    cerr << "Error: Package size must be a positive integer." << endl;
+                    return 1;
+                }
+            } else {
+                cerr << "Error: Missing argument for " << arg << endl;
+                return 1;
+            }
+        } else {
+            cerr << "Unknown option: " << arg << endl;
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (devicePath.empty() || packageSize <= 0) {
+        cerr << "Error: Both device and package size must be provided." << endl;
+        printUsage(argv[0]);
+        return 1;
+    }
 
     // Set up the SIGINT (Ctrl-C) handler.
     signal(SIGINT, sigintHandler);
 
-    // Start the threads for reading serial data and printing statistics.
+    // Start threads for reading serial data and printing statistics.
     thread reader(readSerial);
     thread printer(printStats);
 
     reader.join();
     printer.join();
 
-    // Print final overall statistics when done.
+    // Print final statistics.
     printFinalStats();
 
     return 0;
