@@ -28,6 +28,7 @@ find_package(trajectory_msgs REQUIRED)
 
 add_executable(sub src/sub.cpp)
 add_executable(pub src/pub.cpp)
+add_executable(tty src/tty.cpp)
 target_include_directories(sub PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
@@ -36,6 +37,7 @@ target_include_directories(pub PUBLIC
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>)
 target_compile_features(sub PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 target_compile_features(pub PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+target_compile_features(tty PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 ament_target_dependencies(
   sub
   rclcpp
@@ -49,6 +51,7 @@ ament_target_dependencies(
 install(TARGETS
   sub
   pub
+  tty
   DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
