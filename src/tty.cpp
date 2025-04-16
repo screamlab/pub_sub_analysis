@@ -26,19 +26,22 @@ int packageSize = 0;  // number of values per package
 // Mutex to protect shared statistics
 mutex mtx;
 
-// Global statistics
+// Global statistics for package loss tracking.
 int first_seq = -1;        // first package sequence seen
 int last_seq = -1;         // last package sequence seen
-int overall_received = 0;  // count of logs processed (each log equals one package received)
+int overall_received = 0;  // count of packages received
 int overall_loss = 0;      // accumulated lost packages
 
-// For per-second stats
-int current_sec = 0;       // current second (epoch time) for which we are accumulating
+// Per-second statistics.
+int current_sec = 0;       // current epoch second used to accumulate per-second stats
 int sec_expected = 0;      // expected package count in the current second (sum of differences)
-int sec_received = 0;      // number of logs received in current second
-int sec_loss = 0;          // lost packages in current second
-vector<int> loss_per_sec;  // history (each element = lost packages in a finished second)
+int sec_received = 0;      // number of packages received in the current second
+int sec_loss = 0;          // lost packages in the current second
+vector<int> loss_per_sec;  // history: lost packages per finished second
+vector<int> receive_rate_per_sec;  // history: packages received per finished second
 
+// Start time for overall rate calculation.
+chrono::steady_clock::time_point start_time;
 
 // Print usage information.
 void printUsage(const char *progName) {
@@ -46,7 +49,7 @@ void printUsage(const char *progName) {
          << "Options:\n"
          << "  -d, --device   [DEVICE]     Specify the serial device path (e.g., /dev/ttyUSB0).\n"
          << "  -s, --size     [SIZE]       Specify the size of each package (e.g., 11).\n"
-         << "  -h, --help                  Print this help message and exit.\n";
+         << "  -h, --help                 Print this help message and exit.\n";
 }
 
 // SIGINT handler – simply mark the running flag false.
@@ -56,7 +59,7 @@ void sigintHandler(int signum) {
 }
 
 // Helper function to read a full line (ending with '\n') from the serial device.
-// It uses the provided file descriptor and a reference buffer to accumulate partial data.
+// It uses the file descriptor and a buffer that accumulates partial data.
 string readLine(int fd, string &buffer) {
     const int bufsize = 256;
     char temp[bufsize];
@@ -71,7 +74,7 @@ string readLine(int fd, string &buffer) {
         if (n > 0) {
             buffer.append(temp, n);
         } else {
-            // No data available; wait a bit.
+            // No data available; wait a bit before retrying.
             this_thread::sleep_for(chrono::milliseconds(10));
         }
     }
@@ -80,7 +83,7 @@ string readLine(int fd, string &buffer) {
 
 // This thread function reads serial data from the device.
 void readSerial() {
-    // Open device in read/write mode without making it the controlling terminal.
+    // Open the device in read/write mode without making it the controlling terminal.
     int fd = open(devicePath.c_str(), O_RDWR | O_NOCTTY);
     if (fd == -1) {
         cerr << "Error: Failed to open " << devicePath << endl;
@@ -153,12 +156,14 @@ void readSerial() {
 
                 {
                     lock_guard<mutex> lock(mtx);
-                    // Check the time boundary BEFORE updating per-second counters.
+                    // Check if we have crossed a second boundary BEFORE updating current second
+                    // counters.
                     if (current_sec == 0) {
                         current_sec = now_sec;
                     } else if (now_sec != current_sec) {
-                        // Finalize previous second's statistics.
+                        // Finalize the previous second.
                         loss_per_sec.push_back(sec_loss);
+                        receive_rate_per_sec.push_back(sec_received);
                         // Reset per-second counters for the new second.
                         sec_expected = 0;
                         sec_received = 0;
@@ -197,55 +202,98 @@ void printStats() {
     while (running) {
         this_thread::sleep_for(chrono::seconds(1));
         lock_guard<mutex> lock(mtx);
+
+        // Compute current loss percentage.
         double curLossPercent = (sec_expected > 0) ? (100.0 * sec_loss / sec_expected) : 0.0;
         int overall_expected = overall_received + overall_loss;
         double overallLossPercent =
             (overall_expected > 0) ? (100.0 * overall_loss / overall_expected) : 0.0;
 
-        // Compute standard deviation of loss/sec from finished seconds.
-        double sum = 0;
+        // Calculate total elapsed time for overall receive rate.
+        double elapsed = chrono::duration_cast<chrono::duration<double>>(
+                             chrono::steady_clock::now() - start_time)
+                             .count();
+        double total_receive_rate = (elapsed > 0) ? (overall_received / elapsed) : 0.0;
+
+        // Calculate stdev of per-second loss rates.
+        double lossSum = 0;
         for (int loss : loss_per_sec)
-            sum += loss;
-        double mean = loss_per_sec.empty() ? 0.0 : sum / loss_per_sec.size();
-        double variance = 0;
+            lossSum += loss;
+        double lossMean = loss_per_sec.empty() ? 0.0 : lossSum / loss_per_sec.size();
+        double lossVariance = 0;
         for (int loss : loss_per_sec)
-            variance += (loss - mean) * (loss - mean);
-        double stdev = loss_per_sec.empty() ? 0.0 : sqrt(variance / loss_per_sec.size());
+            lossVariance += (loss - lossMean) * (loss - lossMean);
+        double stdevLoss = loss_per_sec.empty() ? 0.0 : sqrt(lossVariance / loss_per_sec.size());
+
+        // Calculate stdev of per-second receive rates.
+        double recvSum = 0;
+        for (int rate : receive_rate_per_sec)
+            recvSum += rate;
+        double recvMean =
+            receive_rate_per_sec.empty() ? 0.0 : recvSum / receive_rate_per_sec.size();
+        double recvVariance = 0;
+        for (int rate : receive_rate_per_sec)
+            recvVariance += (rate - recvMean) * (rate - recvMean);
+        double stdevRecv =
+            receive_rate_per_sec.empty() ? 0.0 : sqrt(recvVariance / receive_rate_per_sec.size());
 
         cout << "========================================" << endl;
         cout << "Current Loss/sec: " << sec_loss << ", Current Loss Percentage: " << curLossPercent
              << " %" << endl;
         cout << "Total Data Count: " << overall_expected << ", Total Loss Count: " << overall_loss
              << ", Total Loss Percentage: " << overallLossPercent << " %" << endl;
-        cout << "stdev Loss/sec: " << stdev << endl;
+        cout << "stdev Loss/sec: " << stdevLoss << endl;
+        cout << "Current receive rate: " << sec_received << " Hz" << endl;
+        cout << "Total receive rate: " << total_receive_rate << " Hz" << endl;
+        cout << "stdev receive rate: " << stdevRecv << endl;
     }
 }
 
-// After SIGINT (or when running stops), print overall statistics.
+// After SIGINT (or when running stops), print final overall statistics.
 void printFinalStats() {
     lock_guard<mutex> lock(mtx);
-    // If there is an unfinished second, record its loss value.
+    // Finalize the last second if unfinished.
     if (sec_received > 0) {
         loss_per_sec.push_back(sec_loss);
+        receive_rate_per_sec.push_back(sec_received);
     }
+
+    double elapsed =
+        chrono::duration_cast<chrono::duration<double>>(chrono::steady_clock::now() - start_time)
+            .count();
     int overall_expected = overall_received + overall_loss;
     double overallLossPercent =
         (overall_expected > 0) ? (100.0 * overall_loss / overall_expected) : 0.0;
+    double overall_receive_rate = (elapsed > 0) ? (overall_received / elapsed) : 0.0;
 
-    double sum = 0;
+    // Compute stdev for loss/sec.
+    double lossSum = 0;
     for (int loss : loss_per_sec)
-        sum += loss;
-    double mean = loss_per_sec.empty() ? 0.0 : sum / loss_per_sec.size();
-    double variance = 0;
+        lossSum += loss;
+    double lossMean = loss_per_sec.empty() ? 0.0 : lossSum / loss_per_sec.size();
+    double lossVariance = 0;
     for (int loss : loss_per_sec)
-        variance += (loss - mean) * (loss - mean);
-    double stdev = loss_per_sec.empty() ? 0.0 : sqrt(variance / loss_per_sec.size());
+        lossVariance += (loss - lossMean) * (loss - lossMean);
+    double stdevLoss = loss_per_sec.empty() ? 0.0 : sqrt(lossVariance / loss_per_sec.size());
+
+    // Compute stdev for receive rate.
+    double recvSum = 0;
+    for (int rate : receive_rate_per_sec)
+        recvSum += rate;
+    double recvMean = receive_rate_per_sec.empty() ? 0.0 : recvSum / receive_rate_per_sec.size();
+    double recvVariance = 0;
+    for (int rate : receive_rate_per_sec)
+        recvVariance += (rate - recvMean) * (rate - recvMean);
+    double stdevRecv =
+        receive_rate_per_sec.empty() ? 0.0 : sqrt(recvVariance / receive_rate_per_sec.size());
 
     cout << "\n########### FINAL STATISTICS ###########\n";
     cout << "Overall Data Count: " << overall_expected << endl;
     cout << "Overall Loss Count: " << overall_loss << endl;
     cout << "Overall Loss Percentage: " << overallLossPercent << " %" << endl;
-    cout << "Overall stdev Loss/sec: " << stdev << endl;
+    cout << "Overall stdev Loss/sec: " << stdevLoss << endl;
+    cout << "Overall receive rate: " << overall_receive_rate << " Hz" << endl;
+    cout << "Overall stdev receive rate: " << stdevRecv << endl;
 }
 
 int main(int argc, char *argv[]) {
@@ -254,7 +302,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Simple command-line argument parsing.
+    // Command-line argument parsing.
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -290,6 +338,9 @@ int main(int argc, char *argv[]) {
         printUsage(argv[0]);
         return 1;
     }
+
+    // Set the start time for overall receive rate calculation.
+    start_time = chrono::steady_clock::now();
 
     // Set up the SIGINT (Ctrl-C) handler.
     signal(SIGINT, sigintHandler);
