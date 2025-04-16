@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdio>  // for popen, pclose
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -38,7 +40,15 @@ int sec_expected = 0;      // expected package count in the current second (sum 
 int sec_received = 0;      // number of packages received in the current second
 int sec_loss = 0;          // lost packages in the current second
 vector<int> loss_per_sec;  // history: lost packages per finished second
-vector<int> receive_rate_per_sec;  // history: packages received per finished second
+vector<int> receive_rate_per_sec;  // history: received packages per finished second
+
+// A struct to hold plot data.
+struct PlotData {
+    double time;         // elapsed time (seconds) relative to start
+    double lossPercent;  // current loss percentage in this second
+    double receiveRate;  // current receive rate in Hz for this second
+};
+vector<PlotData> plotData;
 
 // Start time for overall rate calculation.
 chrono::steady_clock::time_point start_time;
@@ -59,7 +69,7 @@ void sigintHandler(int signum) {
 }
 
 // Helper function to read a full line (ending with '\n') from the serial device.
-// It uses the file descriptor and a buffer that accumulates partial data.
+// It uses the file descriptor and an accumulating string buffer.
 string readLine(int fd, string &buffer) {
     const int bufsize = 256;
     char temp[bufsize];
@@ -74,7 +84,7 @@ string readLine(int fd, string &buffer) {
         if (n > 0) {
             buffer.append(temp, n);
         } else {
-            // No data available; wait a bit before retrying.
+            // No data available; wait a bit.
             this_thread::sleep_for(chrono::milliseconds(10));
         }
     }
@@ -156,7 +166,7 @@ void readSerial() {
 
                 {
                     lock_guard<mutex> lock(mtx);
-                    // Check if we have crossed a second boundary BEFORE updating current second
+                    // Check if we have crossed a second boundary BEFORE updating per-second
                     // counters.
                     if (current_sec == 0) {
                         current_sec = now_sec;
@@ -164,6 +174,15 @@ void readSerial() {
                         // Finalize the previous second.
                         loss_per_sec.push_back(sec_loss);
                         receive_rate_per_sec.push_back(sec_received);
+                        // Also record data for plotting.
+                        double currentTime =
+                            chrono::duration<double>(chrono::steady_clock::now() - start_time)
+                                .count();
+                        double curLossPercent =
+                            (sec_expected > 0) ? (100.0 * sec_loss / sec_expected) : 0.0;
+                        PlotData pd{currentTime, curLossPercent, static_cast<double>(sec_received)};
+                        plotData.push_back(pd);
+
                         // Reset per-second counters for the new second.
                         sec_expected = 0;
                         sec_received = 0;
@@ -215,7 +234,7 @@ void printStats() {
                              .count();
         double total_receive_rate = (elapsed > 0) ? (overall_received / elapsed) : 0.0;
 
-        // Calculate stdev of per-second loss rates.
+        // Compute standard deviation of loss/sec.
         double lossSum = 0;
         for (int loss : loss_per_sec)
             lossSum += loss;
@@ -225,7 +244,7 @@ void printStats() {
             lossVariance += (loss - lossMean) * (loss - lossMean);
         double stdevLoss = loss_per_sec.empty() ? 0.0 : sqrt(lossVariance / loss_per_sec.size());
 
-        // Calculate stdev of per-second receive rates.
+        // Compute standard deviation of receive rates.
         double recvSum = 0;
         for (int rate : receive_rate_per_sec)
             recvSum += rate;
@@ -249,13 +268,51 @@ void printStats() {
     }
 }
 
-// After SIGINT (or when running stops), print final overall statistics.
+// Write the collected plot data to a file and use GNUplot to plot it.
+void plotUsingGnuplot() {
+    // Write data to file "plot_data.dat". Each line: <time> <loss_percentage> <receive_rate>
+    ofstream ofs("plot_data.dat");
+    if (!ofs.is_open()) {
+        cerr << "Error: Could not open plot_data.dat for writing" << endl;
+        return;
+    }
+    for (const auto &pd : plotData) {
+        ofs << pd.time << " " << pd.lossPercent << " " << pd.receiveRate << "\n";
+    }
+    ofs.close();
+
+    // Now open a pipe to GNUplot.
+    FILE *gp = popen("gnuplot -persistent", "w");
+    if (gp == nullptr) {
+        cerr << "Error: Could not open pipe to gnuplot" << endl;
+        return;
+    }
+
+    // Generate the GNUplot commands. We set up dual y-axes.
+    fprintf(gp, "set title 'Current Loss Percentage and Receive Rate vs Time'\n");
+    fprintf(gp, "set xlabel 'Time (s)'\n");
+    fprintf(gp, "set ylabel 'Current Loss Percentage %%'\n");
+    fprintf(gp, "set y2label 'Current Receive Rate (Hz)'\n");
+    fprintf(gp, "set y2tics\n");
+    fprintf(gp, "set grid\n");
+    fprintf(gp, "plot 'plot_data.dat' using 1:2 with lines title 'Loss %%', \\\n");
+    fprintf(gp, "     'plot_data.dat' using 1:3 axes x1y2 with lines title 'Receive Rate (Hz)'\n");
+    fflush(gp);
+    pclose(gp);
+}
+
+// After SIGINT (or when running stops), print final overall statistics and plot the collected data.
 void printFinalStats() {
     lock_guard<mutex> lock(mtx);
     // Finalize the last second if unfinished.
     if (sec_received > 0) {
         loss_per_sec.push_back(sec_loss);
         receive_rate_per_sec.push_back(sec_received);
+        double currentTime =
+            chrono::duration<double>(chrono::steady_clock::now() - start_time).count();
+        double curLossPercent = (sec_expected > 0) ? (100.0 * sec_loss / sec_expected) : 0.0;
+        PlotData pd{currentTime, curLossPercent, static_cast<double>(sec_received)};
+        plotData.push_back(pd);
     }
 
     double elapsed =
@@ -294,6 +351,9 @@ void printFinalStats() {
     cout << "Overall stdev Loss/sec: " << stdevLoss << endl;
     cout << "Overall receive rate: " << overall_receive_rate << " Hz" << endl;
     cout << "Overall stdev receive rate: " << stdevRecv << endl;
+
+    // Plot the current loss percentage and receive rate versus time.
+    plotUsingGnuplot();
 }
 
 int main(int argc, char *argv[]) {
@@ -302,7 +362,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Command-line argument parsing.
+    // Parse command-line arguments.
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -352,7 +412,7 @@ int main(int argc, char *argv[]) {
     reader.join();
     printer.join();
 
-    // Print final statistics.
+    // Print final statistics and plot the data.
     printFinalStats();
 
     return 0;
