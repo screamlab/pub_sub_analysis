@@ -39,7 +39,7 @@ int sec_received =
 int sec_loss = 0;  // lost packages in current second
 vector<int> loss_per_sec;  // history (each element = lost packages in a finished second)
 
-// SIGINT handler – simply mark the running flag false
+// SIGINT handler – simply mark the running flag false.
 void sigintHandler(int signum) {
     signum = signum;  // avoid unused parameter warning
     running = false;
@@ -61,16 +61,16 @@ string readLine(int fd, string &buffer) {
         if (n > 0) {
             buffer.append(temp, n);
         } else {
-            // If no data is available, sleep a short while before retrying.
+            // No data available; wait a bit before retrying.
             this_thread::sleep_for(chrono::milliseconds(10));
         }
     }
     return "";
 }
 
-// This thread function reads the serial data from the device.
+// This thread function reads serial data from the device.
 void readSerial() {
-    // Open the device in read/write mode, without making it the controlling terminal.
+    // Open device in read/write mode without making it the controlling terminal.
     int fd = open(devicePath.c_str(), O_RDWR | O_NOCTTY);
     if (fd == -1) {
         cerr << "Error: Failed to open " << devicePath << endl;
@@ -81,7 +81,7 @@ void readSerial() {
     // Set file descriptor to blocking mode.
     fcntl(fd, F_SETFL, 0);
 
-    // Configure the serial port settings.
+    // Configure serial port settings.
     struct termios options;
     if (tcgetattr(fd, &options) < 0) {
         cerr << "Error: tcgetattr() failed" << endl;
@@ -94,14 +94,14 @@ void readSerial() {
     cfsetispeed(&options, B921600);
     cfsetospeed(&options, B921600);
 
-    // Configure 8N1 (8 data bits, no parity, 1 stop bit)
+    // Configure 8N1: 8 data bits, no parity, 1 stop bit.
     options.c_cflag &= ~PARENB;         // disable parity
     options.c_cflag &= ~CSTOPB;         // 1 stop bit
     options.c_cflag &= ~CSIZE;          // clear current data size setting
     options.c_cflag |= CS8;             // 8 data bits
     options.c_cflag |= CREAD | CLOCAL;  // enable receiver, ignore modem control lines
 
-    // Set to raw mode (non-canonical, no echo, no signals)
+    // Set raw mode (non-canonical, no echo, no signals)
     options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
     options.c_iflag &= ~(IXON | IXOFF | IXANY);  // disable software flow control
     options.c_oflag &= ~OPOST;                   // disable output processing
@@ -120,7 +120,7 @@ void readSerial() {
                 double packageValue = 0.0;
                 bool gotValue = false;
 
-                // Read subsequent lines until we have 11 numbers.
+                // Read subsequent lines until 11 numbers are obtained.
                 while (numbersRead < 11 && running) {
                     string numsLine = readLine(fd, dataBuffer);
                     istringstream iss(numsLine);
@@ -137,14 +137,26 @@ void readSerial() {
                 }
 
                 int seq = static_cast<int>(packageValue);
-
-                // Get the current second (epoch seconds).
+                // Get the current time (epoch seconds).
                 int now_sec =
                     static_cast<int>(chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
-                // Update global statistics.
                 {
                     lock_guard<mutex> lock(mtx);
+                    // Check for time boundary BEFORE updating per-second counters.
+                    if (current_sec == 0) {
+                        current_sec = now_sec;
+                    } else if (now_sec != current_sec) {
+                        // Finalize the previous second.
+                        loss_per_sec.push_back(sec_loss);
+                        // Reset per-second counters for the new second.
+                        sec_expected = 0;
+                        sec_received = 0;
+                        sec_loss = 0;
+                        current_sec = now_sec;
+                    }
+
+                    // Process packet sequence.
                     if (first_seq < 0) {
                         first_seq = seq;
                         last_seq = seq;
@@ -153,26 +165,15 @@ void readSerial() {
                         int diff = seq - last_seq;
                         int lost = (diff > 1) ? (diff - 1) : 0;
 
-                        overall_received++;    // one package received
+                        overall_received++;    // count one package received
                         overall_loss += lost;  // update overall lost count
 
-                        // Update per-second counters.
+                        // Update per-second counters for the current log.
                         sec_expected += diff;
                         sec_received++;
                         sec_loss += lost;
 
                         last_seq = seq;
-                    }
-
-                    // Manage per-second boundaries using epoch seconds.
-                    if (current_sec == 0)
-                        current_sec = now_sec;
-                    else if (now_sec != current_sec) {
-                        loss_per_sec.push_back(sec_loss);
-                        current_sec = now_sec;
-                        sec_expected = 0;
-                        sec_received = 0;
-                        sec_loss = 0;
                     }
                 }
             }
@@ -186,13 +187,12 @@ void printStats() {
     while (running) {
         this_thread::sleep_for(chrono::seconds(1));
         lock_guard<mutex> lock(mtx);
-        // Current loss percentage.
         double curLossPercent = (sec_expected > 0) ? (100.0 * sec_loss / sec_expected) : 0.0;
         int overall_expected = overall_received + overall_loss;
         double overallLossPercent =
             (overall_expected > 0) ? (100.0 * overall_loss / overall_expected) : 0.0;
 
-        // Calculate standard deviation of loss/sec from finished seconds.
+        // Compute standard deviation of loss/sec from finished seconds.
         double sum = 0;
         for (int loss : loss_per_sec)
             sum += loss;
@@ -211,9 +211,10 @@ void printStats() {
     }
 }
 
-// Print final statistics upon receiving SIGINT.
+// After SIGINT (or when running stops), print final overall statistics.
 void printFinalStats() {
     lock_guard<mutex> lock(mtx);
+    // If there is an unfinished second, record its loss value.
     if (sec_received > 0) {
         loss_per_sec.push_back(sec_loss);
     }
@@ -242,20 +243,20 @@ int main(int argc, char *argv[]) {
         cerr << "Usage: " << argv[0] << " <serial_device_path>" << endl;
         return 1;
     }
-    // Assign device path from argv.
+    // Set device path from command-line arguments.
     devicePath = argv[1];
 
     // Set up the SIGINT (Ctrl-C) handler.
     signal(SIGINT, sigintHandler);
 
-    // Start the serial reading and statistics printing threads.
+    // Start the threads for reading serial data and printing statistics.
     thread reader(readSerial);
     thread printer(printStats);
 
     reader.join();
     printer.join();
 
-    // Print final overall statistics upon exit.
+    // Print final overall statistics when done.
     printFinalStats();
 
     return 0;
