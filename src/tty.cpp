@@ -276,8 +276,13 @@ void plotUsingGnuplot() {
         cerr << "Error: Could not open plot_data.dat for writing" << endl;
         return;
     }
+    // Compute max receive rate from our in‐memory data :contentReference[oaicite:0]{index=0}
+    double maxRate = 0.0;
     for (const auto &pd : plotData) {
         ofs << pd.time << " " << pd.lossPercent << " " << pd.receiveRate << "\n";
+        if (pd.receiveRate > maxRate) {
+            maxRate = pd.receiveRate;
+        }
     }
     ofs.close();
 
@@ -292,8 +297,12 @@ void plotUsingGnuplot() {
     fprintf(gp, "set title 'Current Loss Percentage and Receive Rate vs Time'\n");
     fprintf(gp, "set xlabel 'Time (s)'\n");
     fprintf(gp, "set ylabel 'Current Loss Percentage %%'\n");
+    fprintf(gp, "set yrange [-5:100]\n");  // force loss% between 0 and 100
+                                           // :contentReference[oaicite:2]{index=2}
     fprintf(gp, "set y2label 'Current Receive Rate (Hz)'\n");
     fprintf(gp, "set y2tics\n");
+    // Use our C++ maxRate (add 10% headroom) :contentReference[oaicite:1]{index=1}
+    fprintf(gp, "set y2range [0:%d]\n", int(maxRate * 1.1));
     fprintf(gp, "set grid\n");
     fprintf(gp, "plot 'plot_data.dat' using 1:2 with lines title 'Loss %%', \\\n");
     fprintf(gp, "     'plot_data.dat' using 1:3 axes x1y2 with lines title 'Receive Rate (Hz)'\n");
