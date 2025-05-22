@@ -6,11 +6,13 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
-#include <cstdio>  // for popen, pclose
+#include <cstdio>  // popen, pclose
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <numeric>  // accumulate
 #include <sstream>
 #include <string>
 #include <thread>
@@ -18,48 +20,45 @@
 
 using namespace std;
 
+// Buffer size for reading from the serial device.
+const size_t bufsize = 256;
+string logFileName = "log.csv";
+
 // Global control flag (set to false on SIGINT)
 atomic<bool> running(true);
 
 // Device path and package size (set via command-line arguments)
 string devicePath;
-int packageSize = 0;  // number of values per package
 
 // Mutex to protect shared statistics
 mutex mtx;
 
-// Global statistics for package loss tracking.
-int first_seq = -1;        // first package sequence seen
-int last_seq = -1;         // last package sequence seen
-int overall_received = 0;  // count of packages received
-int overall_loss = 0;      // accumulated lost packages
+// For computing rates & losses
+int initial_content = 0;
+int last_content = 0;
+int last_pkg_cnt = -1;
+bool initial_set = true;
 
-// Per-second statistics.
-int current_sec = 0;       // current epoch second used to accumulate per-second stats
-int sec_expected = 0;      // expected package count in the current second (sum of differences)
-int sec_received = 0;      // number of packages received in the current second
-int sec_loss = 0;          // lost packages in the current second
-vector<int> loss_per_sec;  // history: lost packages per finished second
-vector<int> receive_rate_per_sec;  // history: received packages per finished second
+int total_recv_pkgs = 0;
+int total_lost_pkgs = 0;
+int sec_recv_pkgs = 0;
+int sec_lost_pkgs = 0;
 
-// A struct to hold plot data.
-struct PlotData {
-    double time;         // elapsed time (seconds) relative to start
-    double lossPercent;  // current loss percentage in this second
-    double receiveRate;  // current receive rate in Hz for this second
-};
-vector<PlotData> plotData;
+// History of per-second stats (for avg & stdev)
+vector<double> lossPercHistory;
+vector<int> recvRateHistory;
 
 // Start time for overall rate calculation.
 chrono::steady_clock::time_point start_time;
 
 // Print usage information.
 void printUsage(const char *progName) {
-    cout << "Usage: " << progName << " -d <serial_device_path> -s <package_size>\n\n"
+    cout << "Usage: " << progName << " -d <serial_device_path> [-l <log_file>]\n\n"
          << "Options:\n"
          << "  -d, --device   [DEVICE]     Specify the serial device path (e.g., /dev/ttyUSB0).\n"
-         << "  -s, --size     [SIZE]       Specify the size of each package (e.g., 11).\n"
-         << "  -h, --help                 Print this help message and exit.\n";
+         << "  -l, --log      [LOG_FILE]   Specify the CSV log file path (default: " << logFileName
+         << ").\n"
+         << "  -h, --help                  Print this help message and exit.\n";
 }
 
 // SIGINT handler – simply mark the running flag false.
@@ -71,7 +70,6 @@ void sigintHandler(int signum) {
 // Helper function to read a full line (ending with '\n') from the serial device.
 // It uses the file descriptor and an accumulating string buffer.
 string readLine(int fd, string &buffer) {
-    const int bufsize = 256;
     char temp[bufsize];
     while (running) {
         size_t pos = buffer.find('\n');
@@ -136,237 +134,143 @@ void readSerial() {
     while (running) {
         // Read a full line from the serial port.
         string line = readLine(fd, dataBuffer);
-        if (!line.empty()) {
-            // Check if this line is a header line (e.g., "#251:")
-            if (line[0] == '#') {
-                int numbersRead = 0;
-                double packageValue = 0.0;
-                bool gotValue = false;
+        if (line.empty())
+            continue;
 
-                // Read subsequent lines until we have obtained packageSize numbers.
-                while (numbersRead < packageSize && running) {
-                    string numsLine = readLine(fd, dataBuffer);
-                    istringstream iss(numsLine);
-                    double val;
-                    while (iss >> val) {
-                        if (!gotValue) {
-                            packageValue = val;
-                            gotValue = true;
-                        }
-                        numbersRead++;
-                        if (numbersRead >= packageSize)
-                            break;
-                    }
-                }
+        // Expected format: "#<pkg_cnt>: <val> <val> ... "
+        istringstream iss(line);
+        string hdr;
+        iss >> hdr;
+        if (hdr.size() < 3 || hdr.front() != '#' || hdr.back() != ':')
+            continue;
+        int pkg_cnt = stoi(hdr.substr(1, hdr.size() - 2));
 
-                int seq = static_cast<int>(packageValue);
-                // Get the current epoch second.
-                int now_sec =
-                    static_cast<int>(chrono::system_clock::to_time_t(chrono::system_clock::now()));
+        // filter out duplicates of the same package ID
+        if (pkg_cnt == last_pkg_cnt) {
+            continue;
+        }
 
-                {
-                    lock_guard<mutex> lock(mtx);
-                    // Check if we have crossed a second boundary BEFORE updating per-second
-                    // counters.
-                    if (current_sec == 0) {
-                        current_sec = now_sec;
-                    } else if (now_sec != current_sec) {
-                        // Finalize the previous second.
-                        loss_per_sec.push_back(sec_loss);
-                        receive_rate_per_sec.push_back(sec_received);
-                        // Also record data for plotting.
-                        double currentTime =
-                            chrono::duration<double>(chrono::steady_clock::now() - start_time)
-                                .count();
-                        double curLossPercent =
-                            (sec_expected > 0) ? (100.0 * sec_loss / sec_expected) : 0.0;
-                        PlotData pd{currentTime, curLossPercent, static_cast<double>(sec_received)};
-                        plotData.push_back(pd);
+        // read the first value in the package; all are identical
+        int content;
+        iss >> content;
 
-                        // Reset per-second counters for the new second.
-                        sec_expected = 0;
-                        sec_received = 0;
-                        sec_loss = 0;
-                        current_sec = now_sec;
-                    }
+        int loss = 0;
+        if (!initial_set) {
+            int diff = content - last_content;
+            if (diff > 1) {
+                loss = diff - 1;
+            }
+        }
 
-                    // Process packet sequence.
-                    if (first_seq < 0) {
-                        first_seq = seq;
-                        last_seq = seq;
-                        overall_received = 1;
-                    } else {
-                        int diff = seq - last_seq;
-                        int lost = (diff > 1) ? (diff - 1) : 0;
-
-                        overall_received++;    // one package received
-                        overall_loss += lost;  // update overall lost count
-
-                        // Update per-second counters for this package.
-                        sec_expected += diff;
-                        sec_received++;
-                        sec_loss += lost;
-
-                        last_seq = seq;
-                    }
-                }
+        // update shared stats
+        {
+            lock_guard<mutex> lk(mtx);
+            if (initial_set) {
+                initial_content = content;
+                initial_set = false;
+            }
+            last_content = content;
+            last_pkg_cnt = pkg_cnt;
+            total_recv_pkgs++;
+            sec_recv_pkgs++;
+            if (loss > 0) {
+                total_lost_pkgs += loss;
+                sec_lost_pkgs += loss;
             }
         }
     }
     close(fd);
 }
 
-// This thread function prints statistics every second.
-void printStats() {
+// Thread that every second computes & prints/logs the 9 required metrics.
+void statsThread() {
+    ofstream logFile(logFileName, ios::app);
+    if (!logFile) {
+        cerr << "Error: cannot open log.csv for writing\n";
+        running = false;
+        return;
+    }
+
+    // Write CSV header if file is empty
+    logFile.seekp(0, ios::end);
+    if (logFile.tellp() == 0) {
+        logFile << "Overall data amount," << "Overall package loss," << "Receive rate (Hz),"
+                << "Package loss this second," << "Loss percentage this second,"
+                << "Average loss percentage," << "Loss percentage stdev,"
+                << "Average receive rate (Hz)," << "Receive rate stdev\n";
+    }
+
     while (running) {
         this_thread::sleep_for(chrono::seconds(1));
-        lock_guard<mutex> lock(mtx);
 
-        // Compute current loss percentage.
-        double curLossPercent = (sec_expected > 0) ? (100.0 * sec_loss / sec_expected) : 0.0;
-        int overall_expected = overall_received + overall_loss;
-        double overallLossPercent =
-            (overall_expected > 0) ? (100.0 * overall_loss / overall_expected) : 0.0;
-
-        // Calculate total elapsed time for overall receive rate.
-        double elapsed = chrono::duration_cast<chrono::duration<double>>(
-                             chrono::steady_clock::now() - start_time)
-                             .count();
-        double total_receive_rate = (elapsed > 0) ? (overall_received / elapsed) : 0.0;
-
-        // Compute standard deviation of loss/sec.
-        double lossSum = 0;
-        for (int loss : loss_per_sec)
-            lossSum += loss;
-        double lossMean = loss_per_sec.empty() ? 0.0 : lossSum / loss_per_sec.size();
-        double lossVariance = 0;
-        for (int loss : loss_per_sec)
-            lossVariance += (loss - lossMean) * (loss - lossMean);
-        double stdevLoss = loss_per_sec.empty() ? 0.0 : sqrt(lossVariance / loss_per_sec.size());
-
-        // Compute standard deviation of receive rates.
-        double recvSum = 0;
-        for (int rate : receive_rate_per_sec)
-            recvSum += rate;
-        double recvMean =
-            receive_rate_per_sec.empty() ? 0.0 : recvSum / receive_rate_per_sec.size();
-        double recvVariance = 0;
-        for (int rate : receive_rate_per_sec)
-            recvVariance += (rate - recvMean) * (rate - recvMean);
-        double stdevRecv =
-            receive_rate_per_sec.empty() ? 0.0 : sqrt(recvVariance / receive_rate_per_sec.size());
-
-        cout << "========================================" << endl;
-        cout << "Current Loss/sec: " << sec_loss << ", Current Loss Percentage: " << curLossPercent
-             << " %" << endl;
-        cout << "Total Data Count: " << overall_expected << ", Total Loss Count: " << overall_loss
-             << ", Total Loss Percentage: " << overallLossPercent << " %" << endl;
-        cout << "stdev Loss/sec: " << stdevLoss << endl;
-        cout << "Current receive rate: " << sec_received << " Hz" << endl;
-        cout << "Total receive rate: " << total_receive_rate << " Hz" << endl;
-        cout << "stdev receive rate: " << stdevRecv << endl;
-    }
-}
-
-// Write the collected plot data to a file and use GNUplot to plot it.
-void plotUsingGnuplot() {
-    // Write data to file "plot_data.dat". Each line: <time> <loss_percentage> <receive_rate>
-    ofstream ofs("plot_data.dat");
-    if (!ofs.is_open()) {
-        cerr << "Error: Could not open plot_data.dat for writing" << endl;
-        return;
-    }
-    // Compute max receive rate from our in‐memory data :contentReference[oaicite:0]{index=0}
-    double maxRate = 0.0;
-    for (const auto &pd : plotData) {
-        ofs << pd.time << " " << pd.lossPercent << " " << pd.receiveRate << "\n";
-        if (pd.receiveRate > maxRate) {
-            maxRate = pd.receiveRate;
+        int recv_sec, lost_sec, total_lost, last_cn, init_cn;
+        {
+            lock_guard<mutex> lk(mtx);
+            recv_sec = sec_recv_pkgs;
+            lost_sec = sec_lost_pkgs;
+            total_lost = total_lost_pkgs;
+            last_cn = last_content;
+            init_cn = initial_content;
+            sec_recv_pkgs = 0;
+            sec_lost_pkgs = 0;
         }
+
+        int content_diff = last_cn - init_cn;
+        int overall_data_amount = content_diff;
+
+        double loss_pct_sec = 0.0;
+        if (recv_sec + lost_sec > 0) {
+            loss_pct_sec = (double)lost_sec / (recv_sec + lost_sec) * 100.0;
+        }
+
+        lossPercHistory.push_back(loss_pct_sec);
+        recvRateHistory.push_back(recv_sec);
+
+        double avg_loss_pct = accumulate(lossPercHistory.begin(), lossPercHistory.end(), 0.0) /
+                              lossPercHistory.size();
+        double sumsq = 0;
+        for (double v : lossPercHistory) {
+            sumsq += (v - avg_loss_pct) * (v - avg_loss_pct);
+        }
+        double stdev_loss_pct = sqrt(sumsq / lossPercHistory.size());
+
+        double avg_recv_rate = accumulate(recvRateHistory.begin(), recvRateHistory.end(), 0.0) /
+                               recvRateHistory.size();
+        sumsq = 0;
+        for (int v : recvRateHistory) {
+            sumsq += (v - avg_recv_rate) * (v - avg_recv_rate);
+        }
+        double stdev_recv_rate = sqrt(sumsq / recvRateHistory.size());
+
+        // 1) Human-readable block to stdout and old log.dat (if you still want it)
+        ostringstream human;
+        human << "Overall data amount: " << overall_data_amount << "\n"
+              << "Overall package loss: " << total_lost << "\n"
+              << "Receive rate: " << recv_sec << " Hz" << "\n"
+              << "Package loss this second: " << lost_sec << "\n"
+              << "Loss percentage this second: " << loss_pct_sec << " %\n"
+              << "Average loss percentage: " << avg_loss_pct << " %\n"
+              << "Loss percentage stdev: " << stdev_loss_pct << " %\n"
+              << "Average receive rate: " << avg_recv_rate << " Hz\n"
+              << "Receive rate stdev: " << stdev_recv_rate << " Hz\n\n";
+
+        string block = human.str();
+        cout << block;
+        // (If you still want the old .dat file, uncomment:)
+        // ofstream old("log.dat", ios::app); old<<block; old.close();
+
+        // 2) CSV row to log.csv
+        logFile << overall_data_amount << ',' << total_lost << ',' << recv_sec << ',' << lost_sec
+                << ',' << fixed << setprecision(6) << loss_pct_sec << ',' << avg_loss_pct << ','
+                << stdev_loss_pct << ',' << avg_recv_rate << ',' << stdev_recv_rate << '\n';
+        logFile.flush();
     }
-    ofs.close();
 
-    // Now open a pipe to GNUplot.
-    FILE *gp = popen("gnuplot -persistent", "w");
-    if (gp == nullptr) {
-        cerr << "Error: Could not open pipe to gnuplot" << endl;
-        return;
-    }
-
-    // Generate the GNUplot commands. We set up dual y-axes.
-    fprintf(gp, "set title 'Current Loss Percentage and Receive Rate vs Time'\n");
-    fprintf(gp, "set xlabel 'Time (s)'\n");
-    fprintf(gp, "set ylabel 'Current Loss Percentage %%'\n");
-    fprintf(gp, "set yrange [-5:100]\n");  // force loss% between 0 and 100
-                                           // :contentReference[oaicite:2]{index=2}
-    fprintf(gp, "set y2label 'Current Receive Rate (Hz)'\n");
-    fprintf(gp, "set y2tics\n");
-    // Use our C++ maxRate (add 10% headroom) :contentReference[oaicite:1]{index=1}
-    fprintf(gp, "set y2range [0:%d]\n", int(maxRate * 1.1));
-    fprintf(gp, "set grid\n");
-    fprintf(gp, "plot 'plot_data.dat' using 1:2 with lines title 'Loss %%', \\\n");
-    fprintf(gp, "     'plot_data.dat' using 1:3 axes x1y2 with lines title 'Receive Rate (Hz)'\n");
-    fflush(gp);
-    pclose(gp);
-}
-
-// After SIGINT (or when running stops), print final overall statistics and plot the collected data.
-void printFinalStats() {
-    lock_guard<mutex> lock(mtx);
-    // Finalize the last second if unfinished.
-    if (sec_received > 0) {
-        loss_per_sec.push_back(sec_loss);
-        receive_rate_per_sec.push_back(sec_received);
-        double currentTime =
-            chrono::duration<double>(chrono::steady_clock::now() - start_time).count();
-        double curLossPercent = (sec_expected > 0) ? (100.0 * sec_loss / sec_expected) : 0.0;
-        PlotData pd{currentTime, curLossPercent, static_cast<double>(sec_received)};
-        plotData.push_back(pd);
-    }
-
-    double elapsed =
-        chrono::duration_cast<chrono::duration<double>>(chrono::steady_clock::now() - start_time)
-            .count();
-    int overall_expected = overall_received + overall_loss;
-    double overallLossPercent =
-        (overall_expected > 0) ? (100.0 * overall_loss / overall_expected) : 0.0;
-    double overall_receive_rate = (elapsed > 0) ? (overall_received / elapsed) : 0.0;
-
-    // Compute stdev for loss/sec.
-    double lossSum = 0;
-    for (int loss : loss_per_sec)
-        lossSum += loss;
-    double lossMean = loss_per_sec.empty() ? 0.0 : lossSum / loss_per_sec.size();
-    double lossVariance = 0;
-    for (int loss : loss_per_sec)
-        lossVariance += (loss - lossMean) * (loss - lossMean);
-    double stdevLoss = loss_per_sec.empty() ? 0.0 : sqrt(lossVariance / loss_per_sec.size());
-
-    // Compute stdev for receive rate.
-    double recvSum = 0;
-    for (int rate : receive_rate_per_sec)
-        recvSum += rate;
-    double recvMean = receive_rate_per_sec.empty() ? 0.0 : recvSum / receive_rate_per_sec.size();
-    double recvVariance = 0;
-    for (int rate : receive_rate_per_sec)
-        recvVariance += (rate - recvMean) * (rate - recvMean);
-    double stdevRecv =
-        receive_rate_per_sec.empty() ? 0.0 : sqrt(recvVariance / receive_rate_per_sec.size());
-
-    cout << "\n########### FINAL STATISTICS ###########\n";
-    cout << "Overall Data Count: " << overall_expected << endl;
-    cout << "Overall Loss Count: " << overall_loss << endl;
-    cout << "Overall Loss Percentage: " << overallLossPercent << " %" << endl;
-    cout << "Overall stdev Loss/sec: " << stdevLoss << endl;
-    cout << "Overall receive rate: " << overall_receive_rate << " Hz" << endl;
-    cout << "Overall stdev receive rate: " << stdevRecv << endl;
-
-    // Plot the current loss percentage and receive rate versus time.
-    plotUsingGnuplot();
+    logFile.close();
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 5) {
+    if (argc < 3) {
         printUsage(argv[0]);
         return 1;
     }
@@ -384,13 +288,9 @@ int main(int argc, char *argv[]) {
                 cerr << "Error: Missing argument for " << arg << endl;
                 return 1;
             }
-        } else if (arg == "-s" || arg == "--size") {
+        } else if (arg == "-l" || arg == "--log") {
             if (i + 1 < argc) {
-                packageSize = atoi(argv[++i]);
-                if (packageSize <= 0) {
-                    cerr << "Error: Package size must be a positive integer." << endl;
-                    return 1;
-                }
+                logFileName = argv[++i];
             } else {
                 cerr << "Error: Missing argument for " << arg << endl;
                 return 1;
@@ -402,8 +302,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (devicePath.empty() || packageSize <= 0) {
-        cerr << "Error: Both device and package size must be provided." << endl;
+    if (devicePath.empty()) {
+        cerr << "Error: Device path must be provided." << endl;
         printUsage(argv[0]);
         return 1;
     }
@@ -416,13 +316,10 @@ int main(int argc, char *argv[]) {
 
     // Start threads for reading serial data and printing statistics.
     thread reader(readSerial);
-    thread printer(printStats);
+    thread stats(statsThread);
 
     reader.join();
-    printer.join();
-
-    // Print final statistics and plot the data.
-    printFinalStats();
+    stats.join();
 
     return 0;
 }
